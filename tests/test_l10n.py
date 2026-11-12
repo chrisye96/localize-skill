@@ -287,6 +287,149 @@ class CheckTest(unittest.TestCase):
         self.assertEqual([r[1] for r in rows], ["a"])
 
 
+README = """<p align="center"><img src="logo.svg" alt="Tool logo"></p>
+
+# Tool
+
+**English** | [中文](README.zh-CN.md)
+
+[![CI](https://img.shields.io/badge/ci-passing-green)](https://example.com/ci)
+
+> **Fast.** Works offline.
+
+Run it once. See [CLI mode](#cli-mode) and `--help`.
+
+![The main screen](docs/screen.png)
+
+- **Sync**: copies files to https://example.com/drop
+- Pick `config.json`
+
+| Key | Does |
+|---|---|
+| `P` | Pick a photo |
+
+## CLI mode
+
+```bash
+tool --sync   # copy everything
+```
+
+```
+src/
+  main.py      entry point
+  io/          input.py  output.py
+```
+
+```
++--------+
+| Box ok |   # stays
++--------+
+```
+
+[docs]: https://example.com/docs
+
+---
+"""
+
+
+class MarkdownTest(unittest.TestCase):
+    langs = ["en", "zh-CN", "zh-TW"]
+
+    def test_split_finds_prose_comments_and_alt_text_and_rebuilds_the_original(self):
+        source, skel = l10n.md_split(README)
+        for text in ["Tool logo", "**Fast.** Works offline.", "Run it once. See [CLI mode](#cli-mode) and `--help`.",
+                     "The main screen", "**Sync**: copies files to https://example.com/drop", "Pick a photo", "CLI mode",
+                     "copy everything", "entry point", "Key", "Does"]:
+            self.assertIn(text, source)
+        for kept in ["CI", "input.py  output.py", "Box ok", "stays", "`P`"]:
+            self.assertNotIn(kept, source)  # badges, file name rows, box drawings and code-only cells stay as they are
+        text, problems = l10n.md_build(skel, source, source, "en", self.langs)
+        self.assertEqual(problems, [])
+        expected = README.replace("**English** | [中文](README.zh-CN.md)", "**English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)")
+        self.assertEqual(text, expected)
+
+    def test_crlf_survives_and_a_missing_language_line_is_added_under_the_title(self):
+        source, skel = l10n.md_split("# Tool\r\n\r\nHello.\r\n")
+        text, _ = l10n.md_build(skel, source, {"Tool": "工具", "Hello.": "你好。"}, "zh-CN", self.langs)
+        self.assertEqual(text, "# 工具\r\n\r\n[English](README.md) | **简体中文** | [繁體中文](README.zh-TW.md)\r\n\r\n你好。\r\n")
+
+    def test_segments_are_keyed_by_their_english_so_an_inserted_paragraph_shifts_nothing(self):
+        source, _ = l10n.md_split("# T\n\nOne.\n\nTwo.\n")
+        target = {"T": "T", "One.": "一。", "Two.": "二。"}
+        source2, skel2 = l10n.md_split("# T\n\nNew.\n\nOne.\n\nTwo.\n")
+        self.assertEqual(l10n.check(source2, target, "zh-CN")[0], [("New.", "missing translation")])
+        text, problems = l10n.md_build(skel2, source2, dict(target, **{"New.": "新。"}), "zh-CN", self.langs)
+        self.assertIn("新。\n\n一。\n\n二。", text)
+
+    def test_anchors_must_follow_the_translated_heading(self):
+        source, skel = l10n.md_split("# T\n\nSee [CLI mode](#cli-mode).\n\n## CLI mode\n")
+        stale = {"T": "T", "CLI mode": "CLI 模式", "See [CLI mode](#cli-mode).": "见 [CLI 模式](#cli-mode)。"}
+        self.assertTrue(any("#cli-mode" in p for p in l10n.md_build(skel, source, stale, "zh-CN", self.langs)[1]))
+        fixed = dict(stale, **{"See [CLI mode](#cli-mode).": "见 [CLI 模式](#cli-模式)。"})
+        self.assertEqual(l10n.md_build(skel, source, fixed, "zh-CN", self.langs)[1], [])
+        self.assertEqual(l10n.md_slug("Install & run `tool` (Windows)"), "install--run-tool-windows")
+
+    def test_language_line_names_every_language_in_its_own_language(self):
+        self.assertEqual(l10n.md_langline(self.langs, "zh-TW"), "[English](README.md) | [简体中文](README.zh-CN.md) | **繁體中文**")
+
+
+class ReadmeCheckTest(unittest.TestCase):
+    def test_code_links_and_urls_must_survive(self):
+        src = {"a": "Run `tool --sync` or see [docs](https://x.dev/docs) and https://x.dev/faq"}
+        self.assertEqual(l10n.check(src, {"a": "运行 `tool --sync`，或参阅[文档](https://x.dev/docs)和 https://x.dev/faq"}, "zh-CN")[0], [])
+        errors = dict(l10n.check(src, {"a": "运行 `tool`，或参阅[文档](https://x.dev/zh/docs)和 https://x.dev/faq"}, "zh-CN")[0])
+        self.assertIn("code, links or URLs changed", errors["a"])
+
+    def test_bold_that_markdown_would_not_render_is_an_error(self):
+        src = {"a": "**Done.** Next step"}
+        self.assertIn("bold will not render", dict(l10n.check(src, {"a": "**完成。**下一步"}, "zh-CN")[0])["a"])
+        self.assertEqual(l10n.check(src, {"a": "**完成**。下一步"}, "zh-CN")[0], [])
+        self.assertEqual(l10n.check(src, {"a": "**完成。** 下一步"}, "zh-CN")[0], [])
+        self.assertIn("bold will not render", dict(l10n.check({"a": "Press **[OK]** now"}, {"a": "按**「確定」**鍵"}, "zh-TW")[0])["a"])
+
+    def test_wrong_chinese_script_is_a_warning(self):
+        self.assertTrue(any("Simplified" in m for _, m in l10n.check({"a": "Open the file"}, {"a": "開啟这个檔案"}, "zh-TW")[1]))
+        self.assertTrue(any("Traditional" in m for _, m in l10n.check({"a": "Open the file"}, {"a": "打開這个文件"}, "zh-CN")[1]))
+        self.assertEqual(l10n.zh_script("zh-Hant-HK"), "hant")
+        self.assertEqual(l10n.zh_script("zh-SG"), "hans")
+        self.assertEqual(len(l10n.ZH_PAIRS) % 2, 0)
+
+    def test_a_longer_glossary_term_shadows_the_shorter_one_inside_it(self):
+        glossary = {"translation": "翻译", "back-translation": "回译"}
+        self.assertEqual(l10n.check({"a": "a blind back-translation"}, {"a": "盲回译"}, "zh-CN", glossary)[0], [])
+        self.assertEqual(len(l10n.check({"a": "a translation"}, {"a": "回译"}, "zh-CN", glossary)[0]), 1)
+
+    def test_glossary_ignores_urls_and_file_names_and_takes_stems(self):
+        glossary = {"remote": "遥控器", "icons": "图示", "reject*": "排除"}
+        src = {"a": "Get the [release](https://github.com/x/phone-remote/releases) with icons.svg"}
+        self.assertEqual(l10n.check(src, {"a": "下载[发布版](https://github.com/x/phone-remote/releases)和 icons.svg"}, "zh-CN", glossary)[0], [])
+        self.assertEqual(len(l10n.check({"a": "Show rejected photos"}, {"a": "显示被拒的照片"}, "zh-CN", glossary)[0]), 1)
+        self.assertEqual(l10n.check({"a": "Show rejected photos"}, {"a": "显示排除的照片"}, "zh-CN", glossary)[0], [])
+
+    def test_readme_sentences_are_not_ui_labels(self):
+        # a long sentence may end its list with the language's own "etc.", a short label keeps its ellipsis
+        long_src = {"a": "Pick any of the providers, including Gemini, ChatGPT, Claude, Grok, Mistral, ..."}
+        errors, warns = l10n.check(long_src, {"a": "可选任意供应商，包括 Gemini、ChatGPT、Claude、Grok、Mistral 等"}, "zh-CN")
+        self.assertEqual(errors, [])
+        self.assertTrue(any("ellipsis" in m for _, m in warns))
+        # an English UI label kept as it is passes the glossary; a hyphenated compound is not the term
+        glossary = {"profile": "个人档案", "click": "点击"}
+        self.assertEqual(l10n.check({"a": "Open **Profile**"}, {"a": "打开 **Profile**"}, "zh-CN", glossary)[0], [])
+        self.assertEqual(l10n.check({"a": "Double-click the icon"}, {"a": "双击图标"}, "zh-CN", glossary)[0], [])
+        # the other script inside code is on purpose
+        self.assertEqual(l10n.check({"a": "Type `[09:00] 开会`"}, {"a": "輸入 `[09:00] 开会`"}, "zh-TW")[1], [])
+
+    def test_tsv_round_trip_keeps_tabs_newlines_and_backslashes(self):
+        flat = {"C:\\Users\\x": "路径 C:\\Users\\x", "a\tb": "一\n二"}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "zh.tsv"
+            path.write_text(l10n.emit(flat, "tsv", "zh"), encoding="utf-8")
+            self.assertEqual(l10n.load(path), flat)
+
+    def test_code_only_segments_do_not_warn_as_identical(self):
+        self.assertEqual(l10n.check({"a": "`touchpad`", "b": "api.ts"}, {"a": "`touchpad`", "b": "api.ts"}, "zh-TW")[1], [])
+
+
 class ContextTest(unittest.TestCase):
     def test_short_ids_need_quotes_and_uses_are_reported(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1,6 +1,6 @@
 ---
 name: localize
-description: Translate and localize a website, web app, mobile app or desktop software into other languages, with checks that keep the translation accurate. Use this whenever the user wants to add a language, translate UI strings or i18n resource files (JSON, .po, .properties, .arb, Android strings.xml, iOS .strings, JS or Python string tables), localize an app for new markets, review or fix existing translations, or keep translations in sync after new strings were added, even if they only say "make it work in Spanish" or "translate the app". Not for translating a single document or message that is not part of a product UI.
+description: Translate and localize a website, web app, mobile app or desktop software into other languages, with checks that keep the translation accurate. Use this whenever the user wants to add a language, translate UI strings or i18n resource files (JSON, .po, .properties, .arb, Android strings.xml, iOS .strings, JS or Python string tables), localize an app for new markets, review or fix existing translations, keep translations in sync after new strings were added, or translate a project's README or other Markdown docs, even if they only say "make it work in Spanish", "translate the app" or "add a Chinese README". Not for a one-off document or message outside a product, such as a letter or an article.
 ---
 
 # Localize
@@ -15,7 +15,7 @@ Accurate UI translation fails in predictable ways: a one word label translated w
 
 Find where the strings live and which languages exist. Ask the user only what you cannot find out:
 
-- **Target languages and locale variants.** "Spanish" is es-ES or es-419, "Portuguese" is pt-BR or pt-PT, "Chinese" is Simplified or Traditional. If unstated, pick the larger market and say which you picked.
+- **Target languages and locale variants.** "Spanish" is es-ES or es-419, "Portuguese" is pt-BR or pt-PT, "Chinese" is Simplified or Traditional. If unstated, pick the larger market and say which you picked. For Chinese, read `references/chinese.md`: zh-TW is its own localization, not converted characters.
 - **Register.** Formal or informal address (tu/usted, du/Sie, 你/您). Pick one per language, note it in the glossary notes, and keep it consistent.
 - **Critical copy.** Legal, payment and medical text, and the user's main markets, deserve a native reviewer (see step 8).
 
@@ -27,6 +27,8 @@ Detect the format from the files:
 | `.po` / `.pot` | a `.pot` exports as the English source directly. Plural entries become `msgid#0`, `msgid#1`, ... (one id per `msgstr[i]`) |
 | `.properties`, Android `strings.xml`, iOS `.strings` | one file per language. Android `<plurals>` become `name#one`, `name#other`, ... |
 | JS or Python tables such as `zh: { "English text": "..." }` | needs `--lang`; see `references/english-keyed-tables.md` |
+| Markdown: a README, docs pages | `md-split` and `md-build` instead of `export` and `emit`; read `references/readme.md` first |
+| `.tsv` (`id<TAB>text`) | easier to write by hand than JSON; `emit --format tsv` makes one to fill in |
 | YAML, XLIFF, `.xcstrings`, others | convert to flat JSON yourself, or translate in place and still run `check` on the flat JSON |
 
 ### 2. Build the source file
@@ -47,6 +49,8 @@ python scripts/l10n.py context <project-root> --source work/source.json -o work/
 
 This finds where each id is used. A short label is ambiguous without it: "Post" (verb or noun), "Order" (purchase or sort), "Back" (navigate or the body part), "Play" (media or game). Read the context for every string of five words or fewer, and for any string that looks like a button, menu item, tooltip or status. If an id has no hits, look at the neighbouring ids and at the UI itself before guessing.
 
+Look for the project's own terminology too: a terms file, the translation tables of a host application it plugs into, the names its UI already shows in other languages. They outrank any general vocabulary, including `references/chinese.md`.
+
 ### 4. Write the glossary
 
 Create `work/glossary.json` as `{"source term": "required rendering"}`. Include:
@@ -59,7 +63,9 @@ Propose it to the user for the first language and reuse it for every later one; 
 
 - The rendering can be a list of accepted forms, for languages with irregular plurals or inflection: `"window": ["نافذة", "نوافذ"]`. Otherwise a correct plural fails the check.
 - A term that maps to itself is a "keep as is" term (a brand). Those are masked out of the source before the other terms are matched, so `Phone Remote` does not trigger a `phone` rule. Command line flags, `code spans` and placeholders are masked too.
-- Matching is by whole word and by substring of the rendering, so give the stem (`vincul`) when a term appears in several grammatical forms.
+- Matching is by whole word and by substring of the rendering, so give the stem (`vincul`) when a term appears in several grammatical forms. On the source side, a term ending in `*` matches every word that starts with it (`"reject*"` for reject, rejects, rejected); a plain term does not match inside a hyphenated compound (`click` in `Double-click`).
+- Longer terms are matched first and hide the shorter ones inside them, so `back-translation` does not also demand the rendering of `translation`. URLs, link targets and file names are never matched.
+- An English term left as it is in the translation passes: a UI label the product only shows in English (**Profile**) stays correct.
 - If one source word means different things in different places (the OS "Windows" and a "window" in the UI), use a separate glossary file for each set of strings.
 
 ### 5. Translate, then check
@@ -67,7 +73,8 @@ Propose it to the user for the first language and reuse it for every later one; 
 Translate in batches of 30 to 50 strings, with their context in view. Rules that prevent most defects:
 
 - Keep every placeholder byte for byte: `{name}`, `{0}`, `{{name}}`, `%s`, `%d`, `%1$s`, `%@`, and ICU `{count, plural, ...}` arguments. Reorder them freely where the grammar needs it, but never rename, drop or add.
-- Keep markup tags, line breaks, leading symbols (`+ Add`) and trailing ellipses. A closing `…` means the control opens a dialog or needs more input, so `check` fails a translation that drops one or adds one (`...` and `…` count as the same).
+- Keep markup tags, line breaks, leading symbols (`+ Add`) and trailing ellipses. A closing `…` means the control opens a dialog or needs more input, so `check` fails a short string that drops one or adds one (`...` and `…` count as the same); in a long sentence it only warns, since "A, B, ..." may become the language's own "etc.".
+- Keep code spans, link targets and URLs byte for byte (`check` fails a change), and keep `**bold**` renderable: in Chinese and Japanese, a closing `**` right after punctuation needs a space or punctuation after it, or the asterisks show (`**完成。**然后` fails, `**完成**。然后` passes).
 - Do not make a string longer than it needs to be. German and Finnish run 30% or more longer than English; short labels sit in fixed-width buttons. Abbreviate rather than overflow.
 - For languages with several plural forms (Russian, Polish, Arabic, Czech and others), text next to a number such as `{n} min left` cannot agree for every n. Use real plural forms where the project's i18n system has them (ICU `{n, plural, ...}`, i18next `_one`/`_few` keys, gettext `msgstr[i]`, Android `<plurals>`); otherwise rephrase to be number neutral (`Minutes left: {n}`).
 - A plural string needs every form its language uses, not the two English has: Japanese and Chinese take only `other`, Russian `one`, `few`, `many` (plus `other` in ICU, i18next and Android, for fractions), Arabic all six. `check` knows the forms for 75 languages and fails a plural that lacks one. In a gettext file the forms are `msgstr[0]` onwards in that order, and `emit --format po` writes the matching `Plural-Forms` header; if the project's existing header orders them differently, follow the header. A form other than the last may drop the number (Arabic `zero`, English `One file`), but in Russian `one` also covers 21 and 31, so keep the number there.
@@ -161,5 +168,7 @@ In English-keyed tables an edit renames the id, so `rekey` pairs each id that le
 ## References
 
 - `references/english-keyed-tables.md`: projects whose translation tables use the English text as the key (JS and Python), with the integration points to touch when adding a language. Read it when the `export` of a `.js` or `.py` file is involved.
+- `references/readme.md`: translating a README or other Markdown document with `md-split` and `md-build` (worktree, round trip, code comments, anchors, bold, the language line). Read it for any Markdown job.
+- `references/chinese.md`: Simplified versus Traditional Chinese, the vocabulary that differs, typography, and how to quote a UI the product does not show in that variant.
 - `references/review-status.md`: the review status record of step 8 (levels, template, one row per batch). Read it before writing or updating that record.
 - `references/phone-remote.md`: the worked example this skill was built and tested on.
