@@ -10,13 +10,17 @@ Accurate UI translation fails in predictable ways: a one word label translated w
 | Inconsistent terms | a glossary that `check` enforces (with masking for brands and flags, and lists of accepted forms) |
 | Broken placeholders and markup | `check` compares `{x}`, `{{x}}`, `%s`, `%1$s`, `%@`, ICU arguments, HTML tags and line breaks |
 | Meaning drift | `blind` and `backtrans`: a blind back-translation, ranked by drift |
-| Plural, length and script problems | warnings for languages with several plural forms, overlong strings, text not in the target script |
+| Plurals | `check` knows which plural forms 75 languages need, and fails an ICU plural, i18next `_one`/`_few` group, gettext `msgstr[i]` set or Android `<plurals>` that lacks one |
+| Length and script problems | warnings for overlong strings and text not in the target script; a dropped or added trailing `…` is an error |
+| Edited English | `rekey` carries translations across case, punctuation and spacing edits, and lists every other edit with the old translation |
+| Over-eager reviews | the workflow separates corrections from preferences, and `diff` lists every change for the reviewer |
+| Regional variants | `regional` keeps only the rows es-MX changes from es, and refuses script variants |
 | RTL and layout | a checklist in the workflow; the UI has to be looked at |
-| Reliability claims | the report states what was machine translated and recommends a native reviewer for legal, payment and medical text |
+| Reliability claims | a review status record in the project, with fixed levels from `machine` to `native-line-by-line`; legal, payment and medical text gets a native reviewer |
 
 ## Formats
 
-JSON (flat or nested) and `.arb`, `.po`, `.properties`, Android `strings.xml`, iOS `.strings`, and JS or Python tables keyed by the English text. Anything else can be converted to flat JSON first; the checks work on `{id: text}`.
+JSON (flat or nested) and `.arb`, `.po`/`.pot`, `.properties`, Android `strings.xml`, iOS `.strings`, and JS or Python tables keyed by the English text. Plural entries are read as one id per form. Anything else can be converted to flat JSON first; the checks work on `{id: text}`.
 
 ## Install
 
@@ -36,8 +40,9 @@ python scripts/l10n.py --help
 
 ```
 SKILL.md                              the workflow the agent follows
-scripts/l10n.py                       export, context, check, emit, blind, backtrans
+scripts/l10n.py                       export, context, check, emit, rekey, regional, diff, blind, backtrans
 references/english-keyed-tables.md    projects that use the English text as the key
+references/review-status.md           the review status record: levels and template
 references/phone-remote.md            worked example this skill was built and tested on
 tests/test_l10n.py                    python -m unittest discover -s tests
 ```

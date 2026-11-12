@@ -23,9 +23,9 @@ Detect the format from the files:
 
 | Format | Notes |
 |---|---|
-| JSON, `.arb` | flat, or nested (use `--nested`; ids become dotted paths) |
-| `.po` / `.pot` | plural entries are skipped with a note; translate those with a gettext tool |
-| `.properties`, Android `strings.xml`, iOS `.strings` | one file per language |
+| JSON, `.arb` | flat, or nested (use `--nested`; ids become dotted paths). i18next plural keys (`file_one`, `file_other`) and ICU plurals are checked per language |
+| `.po` / `.pot` | a `.pot` exports as the English source directly. Plural entries become `msgid#0`, `msgid#1`, ... (one id per `msgstr[i]`) |
+| `.properties`, Android `strings.xml`, iOS `.strings` | one file per language. Android `<plurals>` become `name#one`, `name#other`, ... |
 | JS or Python tables such as `zh: { "English text": "..." }` | needs `--lang`; see `references/english-keyed-tables.md` |
 | YAML, XLIFF, `.xcstrings`, others | convert to flat JSON yourself, or translate in place and still run `check` on the flat JSON |
 
@@ -67,9 +67,10 @@ Propose it to the user for the first language and reuse it for every later one; 
 Translate in batches of 30 to 50 strings, with their context in view. Rules that prevent most defects:
 
 - Keep every placeholder byte for byte: `{name}`, `{0}`, `{{name}}`, `%s`, `%d`, `%1$s`, `%@`, and ICU `{count, plural, ...}` arguments. Reorder them freely where the grammar needs it, but never rename, drop or add.
-- Keep markup tags, line breaks, leading symbols (`+ Add`) and trailing ellipses.
+- Keep markup tags, line breaks, leading symbols (`+ Add`) and trailing ellipses. A closing `…` means the control opens a dialog or needs more input, so `check` fails a translation that drops one or adds one (`...` and `…` count as the same).
 - Do not make a string longer than it needs to be. German and Finnish run 30% or more longer than English; short labels sit in fixed-width buttons. Abbreviate rather than overflow.
-- For languages with several plural forms (Russian, Polish, Arabic, Czech and others), text next to a number such as `{n} min left` cannot agree for every n. Rephrase to be number neutral (`Minutes left: {n}`), or use real plural forms if the project's i18n system supports them.
+- For languages with several plural forms (Russian, Polish, Arabic, Czech and others), text next to a number such as `{n} min left` cannot agree for every n. Use real plural forms where the project's i18n system has them (ICU `{n, plural, ...}`, i18next `_one`/`_few` keys, gettext `msgstr[i]`, Android `<plurals>`); otherwise rephrase to be number neutral (`Minutes left: {n}`).
+- A plural string needs every form its language uses, not the two English has: Japanese and Chinese take only `other`, Russian `one`, `few`, `many` (plus `other` in ICU, i18next and Android, for fractions), Arabic all six. `check` knows the forms for 75 languages and fails a plural that lacks one. In a gettext file the forms are `msgstr[0]` onwards in that order, and `emit --format po` writes the matching `Plural-Forms` header; if the project's existing header orders them differently, follow the header. A form other than the last may drop the number (Arabic `zero`, English `One file`), but in Russian `one` also covers 21 and 31, so keep the number there.
 - Match the tone of the source. UI text is short, direct and consistent. Do not add politeness or explanations the source does not have.
 
 Save as `work/<lang>.json`, then:
@@ -94,7 +95,7 @@ Translate the values of `<lang>.blind.json` back to English, literally and even 
 python scripts/l10n.py backtrans --source work/source.json --back work/<lang>.back.json --target work/<lang>.json
 ```
 
-If you can spawn a subagent, give it only the blinded file and the glossary: that is the only way to get a pass that has not seen the source. If you cannot, do it as a separate step; it still catches meaning errors, but not tone or fluency, and you should say it was not independent.
+If you can spawn a subagent, give it only the blinded file and the glossary: that is the only way to get a pass that has not seen the source. If you can choose its model, pick a different one from your own (another size or family): a second model does not share your blind spots, so it catches more of the meanings you got wrong. If you cannot, do it as a separate step; it still catches meaning errors, but not tone or fluency, and you should say it was not independent.
 
 The most drifted strings are listed first. The score compares words, so it is noisy: a third of a typical list is just synonyms. Read the flagged ones and ask whether the back-translation lost or changed the meaning (fix the translation) or merely reworded it (leave it). In practice this pass finds ambiguous words, for example a media "rewind" that came back as "go back", or a "sleep timer" that came back as "stop timer".
 
@@ -106,6 +107,14 @@ python scripts/l10n.py emit work/<lang>.json --format <json|js|py|properties|xml
 
 `js` and `py` print a table block to paste into the existing table (`--indent` matches the block to the surrounding code); the other formats write a whole new language file. Then wire the language in: register it where the project lists languages, add the language switcher entry, and handle the things a string table cannot:
 
+- **A regional variant next to its base** (es-MX beside es, pt-PT beside pt): translate it in full first, so `check` and the back-translation see every string. Then, only if the project's runtime falls back from region to base (i18next, Android `values-es-rMX`, iOS and gettext do; a hand-written lookup table usually does not, so read the lookup code), keep only the rows that differ:
+
+  ```
+  python scripts/l10n.py regional work/es-MX.json --base work/es.json --lang es-MX -o work/es-MX.diff.json
+  ```
+
+  Identical rows would otherwise mask later corrections to the base. A script variant (`zh-Hant`, `sr-Latn`) never falls back, since it would show other letters, and neither does Traditional Chinese tagged by region (`zh-TW`, `zh-HK`): `regional` refuses them.
+- **The language's own name in the switcher**: `Español`, `日本語`, `Русский`, `العربية`, not "Spanish" translated into the current UI language. Someone who cannot read the current language must still find theirs. Write regional and script variants the same way (`Português (Brasil)`, `简体中文`, `繁體中文`), and check the switcher still fits with the longest name.
 - **RTL languages** (Arabic, Hebrew, Persian, Urdu): set `dir="rtl"` on the document and prefer CSS logical properties (`margin-inline-start`) over left and right. Look at the actual screens; layout cannot be checked from strings. Setting `dir` mirrors everything, including controls that should keep their order: playback controls (rewind, play, fast forward) and seek buttons, number pads, and anything tied to a physical direction. Platform guidelines mostly keep playback controls left to right, so decide per control and tell the user what you found.
 - **Layout with real strings**: render the longest languages at the narrowest supported width. Wrapping to two lines in a button is usually fine; clipped text or a pushed-out layout is not. Compare with the English layout first, because overflow that already exists in English is not the translation's fault.
 - **Fonts**: confirm the font stack has glyphs for the script (CJK, Arabic, Thai, Devanagari).
@@ -118,11 +127,39 @@ If the project has tests that tie translation tables to the code (some do), run 
 
 Say what was machine translated and not reviewed by a native speaker, list the warnings you accepted, and name the strings you were unsure about. For legal, payment and medical text and for the user's top markets, recommend a native reviewer; `work/<lang>.json` plus the glossary is the right handover. Do not claim a translation is "verified"; it passed mechanical checks and a back-translation, which is strong evidence and not proof.
 
+Then record it in the project, not only in chat: one row per language and batch, with a review level from a fixed list (`machine`, `back-translated`, `native-skimmed`, `native-terminology`, `native-in-app`, `native-line-by-line`). Read `references/review-status.md` for where it goes, the template, and why a later batch of strings gets its own row. When the user later says a native speaker reviewed something, update that row's level.
+
+## Reviewing or fixing existing translations
+
+When the user asks you to review a language that already exists, the risk is the opposite of translating: rewording strings that were fine, so a reviewed translation drifts toward your taste. Sort every change you would make into one of two kinds before touching the file:
+
+- **Correction**: the text is wrong for every reader. A wrong meaning (a "Later" button rendered as "Cancel"), a misspelling, broken grammar or agreement, English left untranslated, the wrong script or locale variant (Traditional characters in a Simplified file, pt-PT spelling in pt-BR), a broken placeholder or markup, a glossary violation. Fix these.
+- **Preference**: another valid wording. A synonym, formal or informal address, word order, a term both readings accept, a shorter phrasing that already fits. Do not apply these; list them for the user with your reason, and apply them only if asked.
+
+A change of terminology across the whole language (every "file" becomes another word) is a decision for the user, not a correction: propose it as a glossary change and apply it everywhere at once if they agree.
+
+Steps: export the language and the source (step 2), gather context (step 3), run `check` with the glossary (step 5) and the back-translation (step 6) to find candidates, read the flagged strings and the short ones yourself, then copy the file and fix only the corrections. Then:
+
+```
+python scripts/l10n.py diff work/<lang>.json work/<lang>.fixed.json
+```
+
+Report every `CHANGED` line with its kind of error (meaning, spelling, grammar, untranslated, script, placeholder, glossary), followed by the preferences you did not apply. A reviewer can then confirm each correction instead of rereading the file. Record the result in the review status (step 8): a review by you is not a native review, and does not raise the level.
+
 ## Keeping it up to date
 
 When new strings are added, export the source again and run `check` against each existing language: new ids show up as `missing translation`, deleted ones as `id not in source`. Translate only the missing ones with the same glossary.
 
+When the English of existing strings was edited, run `rekey` first, so a typo fix does not throw away a translation, and so a changed meaning does not keep a stale one:
+
+```
+python scripts/l10n.py rekey --source work/source.json --target work/<lang>.json [--old-source work/source.old.json] -o work/<lang>.json
+```
+
+In English-keyed tables an edit renames the id, so `rekey` pairs each id that left the source with the most similar new one. In id-keyed files the id stays and the English changes under it, which `check` cannot see at all: pass the source the translation was made from as `--old-source` (export it from the last release or commit). Edits that only touch case, punctuation or spacing are `CARRIED`. Everything else that is similar is listed as `REVIEW` with the old translation, and is left out of the output, so `check` reports it as missing. Reuse the old translation for a pure spelling fix ("Recieve" to "Receive") and translate again when the meaning moved ("Sign in" to "Sign out", "Lose" to "Loose", "Save" to "Save…", which now opens a dialog).
+
 ## References
 
 - `references/english-keyed-tables.md`: projects whose translation tables use the English text as the key (JS and Python), with the integration points to touch when adding a language. Read it when the `export` of a `.js` or `.py` file is involved.
+- `references/review-status.md`: the review status record of step 8 (levels, template, one row per batch). Read it before writing or updating that record.
 - `references/phone-remote.md`: the worked example this skill was built and tested on.

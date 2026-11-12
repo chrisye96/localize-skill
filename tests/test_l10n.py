@@ -1,3 +1,4 @@
+import re
 import sys
 import tempfile
 import unittest
@@ -48,8 +49,13 @@ class ReadTest(unittest.TestCase):
 
     def test_other_formats(self):
         self.assertEqual(l10n.read_properties("# c\na.b=Hello \\u00e9\nc: x\\\n  y\n"), {"a.b": "Hello é", "c": "xy"})
-        po = 'msgid ""\nmsgstr ""\n\nmsgid "Hi %s"\nmsgstr "Hola %s"\n\nmsgid "A"\nmsgid_plural "As"\nmsgstr[0] "a"\n'
-        self.assertEqual(l10n.read_po(po), {"Hi %s": "Hola %s"})
+        po = 'msgid ""\nmsgstr ""\n\nmsgid "Hi %s"\nmsgstr "Hola %s"\n\nmsgid "A"\nmsgid_plural "As"\nmsgstr[0] "a"\nmsgstr[1] "as"\n'
+        self.assertEqual(l10n.read_po(po), {"Hi %s": "Hola %s", "A#0": "a", "A#1": "as"})
+        # a template gives the English, so it can be the source file as it is
+        pot = 'msgid "Hi %s"\nmsgstr ""\n\nmsgid "{n} file"\nmsgid_plural "{n} files"\nmsgstr[0] ""\nmsgstr[1] ""\n'
+        self.assertEqual(l10n.read_po(pot, template=True), {"Hi %s": "Hi %s", "{n} file#0": "{n} file", "{n} file#1": "{n} files"})
+        xml = '<resources><plurals name="files"><item quantity="one">%d file</item><item quantity="other">%d files</item></plurals></resources>'
+        self.assertEqual(l10n.read_android(xml), {"files#one": "%d file", "files#other": "%d files"})
         self.assertEqual(l10n.read_android('<resources><string name="a">It\\\'s <b>ok</b></string></resources>'), {"a": "It's <b>ok</b>"})
         self.assertEqual(l10n.read_strings('/* c */\n"a" = "b \\"q\\"";'), {"a": 'b "q"'})
 
@@ -66,6 +72,21 @@ class RoundTripTest(unittest.TestCase):
                 path.write_text(l10n.emit(flat, fmt, "de", source={k: k for k in flat}), encoding="utf-8")
                 loaded = l10n.load(path)
                 self.assertEqual(loaded, flat)
+
+    def test_plural_groups_survive_po_and_xml(self):
+        source = {"Hi": "Hi", "{n} file#0": "{n} file", "{n} file#1": "{n} files"}
+        ru = {"Hi": "Привет", "{n} file#0": "{n} файл", "{n} file#1": "{n} файла", "{n} file#2": "{n} файлов"}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ru.po"
+            text = l10n.emit(ru, "po", "ru", source=source)
+            self.assertIn("nplurals=3;", text)
+            self.assertIn('msgid_plural "{n} files"', text)
+            path.write_text(text, encoding="utf-8")
+            self.assertEqual(l10n.load(path), ru)
+            ar = {"a": "x", "files#zero": "لا ملفات", "files#one": "ملف", "files#other": "%d ملف"}
+            path = Path(d) / "strings.xml"
+            path.write_text(l10n.emit(ar, "xml", "ar"), encoding="utf-8")
+            self.assertEqual(l10n.load(path), ar)
 
     def test_js_and_py_blocks_read_back(self):
         for fmt in ("js", "py"):
@@ -150,6 +171,111 @@ class CheckTest(unittest.TestCase):
         _, warns = l10n.check({}, {"stale": "x"}, "es")
         self.assertTrue(any("not in source" in m for _, m in warns))
 
+    def test_icu_plural_needs_every_form_the_language_uses(self):
+        src = {"k": "{count, plural, one {# file} other {# files}}"}
+        two = {"k": "{count, plural, one {# файл} other {# файла}}"}
+        four = {"k": "{count, plural, one {# файл} few {# файла} many {# файлов} other {# файла}}"}
+        errors = dict(l10n.check(src, two, "ru")[0])
+        self.assertIn("few, many", errors["k"])
+        self.assertEqual(l10n.check(src, four, "ru")[0], [])
+        self.assertEqual(l10n.check(src, {"k": "{count, plural, other {# 个文件}}"}, "zh-Hans")[0], [])
+        # French "many" (a million) is allowed but not required; nested plurals are checked too
+        self.assertEqual(l10n.check(src, {"k": "{count, plural, one {# fichier} other {# fichiers}}"}, "fr")[0], [])
+        nested = {"k": "{g, select, male {{count, plural, one {# a} other {# b}}} other {{count, plural, one {# a} few {# c} many {# d} other {# b}}}}"}
+        self.assertEqual(len(l10n.check({"k": nested["k"]}, nested, "ru")[0]), 1)
+
+    def test_suffix_plural_groups_by_category(self):
+        source = {"file_one": "{{count}} file", "file_other": "{{count}} files", "step_one": "Step one"}
+        ru = {"file_one": "{{count}} файл", "file_few": "{{count}} файла", "file_many": "{{count}} файлов",
+              "file_other": "{{count}} файла", "step_one": "Шаг первый"}
+        self.assertEqual(l10n.check(source, ru, "ru"), ([], []))
+        errors = dict(l10n.check(source, {k: v for k, v in ru.items() if k != "file_many"}, "ru")[0])
+        self.assertIn("many", errors["file"])
+        # Japanese has one form only: no missing `file_one`
+        self.assertEqual(l10n.check(source, {"file_other": "{{count}} 件", "step_one": "ステップ1"}, "ja")[0], [])
+        # `step_one` has no `step_other`, so it is an ordinary string
+        self.assertIn("step_one", dict(l10n.check(source, {"file_other": "x {{count}}"}, "ja")[0]))
+
+    def test_plural_forms_placeholders(self):
+        source = {"f#one": "One file", "f#other": "{n} files"}
+        errors, warns = l10n.check(source, {"f#zero": "لا ملفات", "f#one": "ملف واحد", "f#two": "ملفان", "f#few": "{n} ملفات",
+                                            "f#many": "{n} ملفًا", "f#other": "{n} ملف"}, "ar")
+        self.assertEqual(errors, [])
+        self.assertTrue(all("drops" in m for _, m in warns))  # zero/one/two may drop {n}: a warning, not an error
+        errors, _ = l10n.check(source, {"f#one": "{n} file {x}", "f#other": "files"}, "en")
+        self.assertEqual(len(errors), 2)  # one added {x}, other lost {n}
+
+    def test_indexed_plural_forms_need_the_language_count(self):
+        source = {"{n} file#0": "{n} file", "{n} file#1": "{n} files"}
+        ok = {"{n} file#0": "{n} файл", "{n} file#1": "{n} файла", "{n} file#2": "{n} файлов"}
+        self.assertEqual(l10n.check(source, ok, "ru"), ([], []))
+        errors = dict(l10n.check(source, {"{n} file#0": "{n} файл", "{n} file#1": "{n} файлов"}, "ru")[0])
+        self.assertIn("3 plural forms", errors["{n} file"])
+        self.assertEqual(l10n.check(source, {"{n} file#0": "{n} 个文件"}, "zh")[0], [])
+        self.assertEqual(dict(l10n.check(source, {}, "ru")[0])["{n} file"], "missing translation")
+
+    def test_plural_expressions_index_the_categories(self):
+        def index(expr, n):
+            parts = re.split(r"\s*\?\s*|\s*:\s*", expr.replace("&&", " and ").replace("||", " or "))
+            for cond, value in zip(parts[:-1:2], parts[1::2]):
+                if eval(cond, {"n": n}):
+                    return int(value)
+            return int(eval(parts[-1], {"n": n}))
+        for lang, (cats, expr) in l10n.PLURALS.items():
+            with self.subTest(lang=lang):
+                self.assertEqual({index(expr, n) for n in range(1001)}, set(range(len(cats))))
+        spot = {"ru": {1: 0, 2: 1, 5: 2, 11: 2, 12: 2, 21: 0, 22: 1, 111: 2}, "pl": {1: 0, 21: 2, 22: 1},
+                "fr": {0: 0, 1: 0, 2: 1}, "lv": {0: 0, 1: 1, 11: 0, 21: 1, 2: 2}, "ar": {0: 0, 1: 1, 2: 2, 3: 3, 11: 4, 100: 5},
+                "lt": {1: 0, 11: 2, 2: 1, 10: 2}, "cy": {3: 3, 6: 4, 4: 5}}
+        for lang, cases in spot.items():
+            for n, want in cases.items():
+                self.assertEqual(index(l10n.PLURALS[lang][1], n), want, (lang, n))
+
+    def test_trailing_ellipsis_must_match(self):
+        errors = dict(self.run_check({"a": "Save as…", "b": "Loading", "c": "Open...", "d": "Export…"},
+                                     {"a": "Guardar como", "b": "Cargando…", "c": "Abrir…", "d": "Exportar... "})[0])
+        self.assertIn("ellipsis", errors["a"])
+        self.assertIn("ellipsis", errors["b"])
+        self.assertNotIn("c", errors)  # "..." and "…" are the same thing
+        self.assertNotIn("d", errors)
+        self.assertEqual(l10n.check({"a": "Save as…"}, {"a": "另存为……"}, "zh")[0], [])
+        # word order may move an ellipsis that is part of an example (found in phone-remote)
+        moved = {"a": "Can't save: the address should look like bilibili.com or https://…"}
+        self.assertEqual(l10n.check(moved, {"a": "保存不了：网址要像 bilibili.com 或 https://… 这样"}, "zh")[0], [])
+
+    def test_regional_keeps_only_what_differs_from_the_base(self):
+        mx = {"a": "Computadora", "b": "Guardar", "f#0": "{n} archivo", "f#1": "{n} archivos", "new": "Nuevo"}
+        es = {"a": "Ordenador", "b": "Guardar", "f#0": "{n} archivo", "f#1": "{n} ficheros"}
+        kept, dropped = l10n.regional(mx, es, "es-MX")
+        self.assertEqual(kept, {"a": "Computadora", "f#0": "{n} archivo", "f#1": "{n} archivos", "new": "Nuevo"})
+        self.assertEqual(dropped, ["b"])  # a plural group is kept whole when one form differs
+        self.assertEqual(l10n.regional({"a": "x"}, {"a": "x"}, "es-419")[1], ["a"])
+        for tag in ("zh-Hant", "sr-Latn", "zh-TW", "pt"):
+            with self.subTest(tag=tag), self.assertRaises(SystemExit):
+                l10n.regional({"a": "x"}, {"a": "x"}, tag)
+
+    def test_diff_lists_changed_added_and_removed(self):
+        old, new = {"a": "x", "b": "y", "c": "z"}, {"a": "x", "b": "Y", "d": "w"}
+        self.assertEqual(l10n.diff(old, new), {"changed": [("b", "y", "Y")], "added": [("d", "w")], "removed": [("c", "z")]})
+
+    def test_rekey_english_keyed_carries_only_cosmetic_edits(self):
+        source = {k: k for k in ["Log in", "Receive files", "Connecting…", "Save…", "Brand new"]}
+        target = {"Log In": "登录", "Recieve files": "接收文件", "Connecting...": "连接中…", "Save": "保存", "Old thing": "旧"}
+        new, carried, review = l10n.rekey(source, target)
+        self.assertEqual(sorted(carried), [("Connecting…", "Connecting..."), ("Log in", "Log In")])
+        self.assertEqual(sorted((r[0], r[1], r[4]) for r in review),
+                         [("Receive files", "Recieve files", "接收文件"), ("Save…", "Save", "保存")])  # "Save…" now opens a dialog
+        self.assertEqual(new, {"Log in": "登录", "Connecting…": "连接中…", "Old thing": "旧"})
+
+    def test_rekey_id_keyed_compares_the_old_english(self):
+        old = {"a": "Delete File", "b": "Sign in", "c": "Help"}
+        source = {"a": "Delete file", "b": "Sign out", "c": "Help"}
+        target = {"a": "Eliminar archivo", "b": "Iniciar sesión", "c": "Ayuda"}
+        new, carried, review = l10n.rekey(source, target, old_source=old)
+        self.assertEqual(carried, [("a", "a")])
+        self.assertEqual([(r[0], r[2], r[3], r[4]) for r in review], [("b", "Sign in", "Sign out", "Iniciar sesión")])
+        self.assertEqual(new, {"a": "Eliminar archivo", "c": "Ayuda"})  # b now shows up as missing in check
+
     def test_blind_hides_ids_and_unblind_restores_them(self):
         target = {"Play or pause": "Reproducir o pausar", "Quit": "Salir"}
         blinded = l10n.blind(target)
@@ -169,6 +295,9 @@ class ContextTest(unittest.TestCase):
             (root / "i18n.js").write_text('"Up": "上"', encoding="utf-8")
             result = l10n.usage_context(root, {"Up": "Up"})
             self.assertEqual(result["Up"]["uses"], ['app.js:1: const x = t("Up");'])
+            (root / "list.js").write_text('t("files", { count })\n', encoding="utf-8")
+            result = l10n.usage_context(root, {"files_one": "{{count}} file", "files_other": "{{count}} files"})
+            self.assertEqual(result["files_one"]["uses"], ['list.js:1: t("files", { count })'])
 
 
 if __name__ == "__main__":
