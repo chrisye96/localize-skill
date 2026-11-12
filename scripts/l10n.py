@@ -8,6 +8,8 @@ Everything is normalized to flat JSON: {id: text}. Ids are whatever the project 
   context  find where each id is used in the code (so the translator sees the UI context)
   check    validate a translation against the source (placeholders, tags, glossary, length, ...)
   emit     write flat JSON back out as json / js / py / properties / xml / strings / po
+  md-split a Markdown document (README, docs) as segments plus a skeleton that keeps code, HTML and layout
+  md-build rebuild it from a translation, with the language links line; checks links, code and #anchors
   rekey    carry translations across cosmetic edits of the English; list the rest for review
   regional keep only the rows of a regional variant (es-MX) that differ from its base language (es)
   diff     what changed between two versions of a translation (for a review report)
@@ -20,6 +22,7 @@ import difflib
 import json
 import re
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
@@ -165,6 +168,22 @@ def read_strings(text):
     return {_unescape(k): _unescape(v) for k, v in re.findall(r'"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"\s*;', text)}
 
 
+def _tsv_unescape(s):
+    return re.sub(r"\\([nt\\])", lambda m: {"n": "\n", "t": "\t", "\\": "\\"}[m.group(1)], s)
+
+
+def read_tsv(text):
+    """id<TAB>text per line, with \\n \\t \\\\ escapes: easier to write by hand than JSON, whose escaping of
+    Windows paths and backslashes goes wrong. Blank lines are skipped."""
+    out = {}
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
+        if line.strip():
+            key, _, value = line.partition("\t")
+            out[_tsv_unescape(key)] = _tsv_unescape(value)
+    return out
+
+
 def load(path, lang=None, nested=False):
     path = Path(path)
     text = path.read_text(encoding="utf-8-sig")
@@ -177,6 +196,8 @@ def load(path, lang=None, nested=False):
         return dict(_flatten(data)) if nested else {k: v for k, v in data.items() if isinstance(v, str) and not k.startswith("@")}
     if ext == ".properties":
         return read_properties(text)
+    if ext == ".tsv":
+        return read_tsv(text)
     if ext in (".po", ".pot"):
         return read_po(text, template=ext == ".pot")
     if ext == ".xml":
@@ -222,6 +243,9 @@ def emit(flat, fmt, lang, source=None, nested=False, indent=2):
     if fmt == "properties":
         esc = lambda s: "".join(c if ord(c) < 128 else "\\u%04x" % ord(c) for c in s.replace("\\", "\\\\")).replace("\n", "\\n")
         return "".join("%s=%s\n" % (k, esc(v)) for k, v in flat.items())
+    if fmt == "tsv":
+        esc = lambda s: s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+        return "".join("%s\t%s\n" % (esc(k), esc(v)) for k, v in flat.items())
     if fmt == "strings":
         return "".join('"%s" = "%s";\n' % (_plain_escape(k), _plain_escape(v)) for k, v in flat.items())
     if fmt == "po":
@@ -373,10 +397,69 @@ SCRIPTS = {
 
 
 def _word(term):
-    return r"(?<!\w)%s(?!\w)" % re.escape(term)
+    """A glossary term as a whole word; `reject*` matches every word starting with `reject` (rejects, rejected)."""
+    # a hyphen joins words: "click" is not a match inside "Double-click"
+    if term.endswith("*"):
+        return r"(?<![\w-])%s[\w-]*" % re.escape(term[:-1])
+    return r"(?<![\w-])%s(?![\w-])" % re.escape(term)
 
 
-def _check_text(src, tgt, base, rule, glossary, keep, max_ratio, form=None, group_placeholders=None):
+# Code spans, link targets and bare URLs carry over unchanged. An in-page #anchor follows its translated
+# heading instead (md-build checks those against the headings).
+URL = re.compile(r"https?://[^\s)>\]\"'，。、；：）」』]+")
+
+
+def _literals(text):
+    links = [t for t in re.findall(r"\]\(([^)\s]+)[^)]*\)", text) if not t.startswith("#")]
+    return Counter(re.findall(r"`[^`]+`", text)) + Counter(links) + Counter(URL.findall(text))
+
+
+def _prose(text):
+    """The words of a text that are translated: placeholders, command line flags, code spans, link targets,
+    URLs and file names removed ("phone-remote" in a link is not the term "remote", icons.svg not "icons")."""
+    text = URL.sub(" ", PLACEHOLDER.sub(" ", text))
+    return re.sub(r"--[\w-]+|`[^`]*`|\]\([^)]*\)|[\w/-]*\w\.[A-Za-z][A-Za-z0-9]{0,4}(?![\w.])", " ", text)
+
+
+def _md_punct(c):
+    return c == "" or unicodedata.category(c)[0] in "PS"
+
+
+def _bold_problems(text):
+    """`**` pairs that Markdown will not render as bold, CommonMark's flanking rules: an opening `**` before
+    punctuation needs whitespace or punctuation in front, a closing one after punctuation needs it behind.
+    Chinese hits this all the time: `**完成。**然后` stays literal asterisks."""
+    problems, runs = [], [m.start() for m in re.finditer(r"(?<!\*)\*\*(?!\*)", text)]
+    for n, i in enumerate(runs):
+        before, after = text[i - 1:i] if i else "", text[i + 2:i + 3]
+        opening = n % 2 == 0
+        if opening:
+            ok = after and not after.isspace() and (not _md_punct(after) or before == "" or before.isspace() or _md_punct(before))
+        else:
+            ok = before and not before.isspace() and (not _md_punct(before) or after == "" or after.isspace() or _md_punct(after))
+        if not ok:
+            problems.append(text[max(0, i - 6):i + 8])
+    return problems
+
+
+# Common characters written differently in Simplified and Traditional Chinese, as (Simplified, Traditional)
+# pairs. Only characters that exist in one of the two scripts are listed (no 后/後, 里/裡, 干/乾).
+ZH_PAIRS = ("这這们們个個为為说說时時发發项項译譯检檢测測试試语語术術词詞复複数數据據库庫码碼软軟开開关關页頁"
+            "网網络絡显顯单單标標记記换換题題区區变變审審释釋链鏈应應写寫读讀规規则則浏瀏览覽机機图圖层層义義"
+            "与與么麼样樣还還进進过過对對从從级級识識别別确確认認组組档檔态態录錄资資夹夾构構绍紹盘盤错錯误誤"
+            "隐隱给給让讓将將线線类類实實场場处處间間设設计計门門转轉颜顏导導务務动動线線书書长長车車东東")
+SIMPLIFIED, TRADITIONAL = set(ZH_PAIRS[0::2]), set(ZH_PAIRS[1::2])
+
+
+def zh_script(lang):
+    """"hans" or "hant" for a Chinese tag (zh-TW, zh-HK and zh-MO are Traditional), else None."""
+    parts = lang.lower().replace("_", "-").split("-")
+    if parts[0] != "zh":
+        return None
+    return "hant" if "hant" in parts or set(parts) & {"tw", "hk", "mo"} else "hans"
+
+
+def _check_text(src, tgt, base, rule, glossary, keep, max_ratio, form=None, group_placeholders=None, zh=None):
     """(errors, warnings) for one translated text, as messages. `form` is set for one form of a plural group:
     its placeholders may be fewer than the source's (Arabic `zero` needs no number) but never others."""
     errors, warnings = [], []
@@ -408,6 +491,9 @@ def _check_text(src, tgt, base, rule, glossary, keep, max_ratio, form=None, grou
                             % (form, sorted(want - have)))
     if Counter(TAG.findall(src)) != Counter(TAG.findall(tgt)):
         errors.append("markup tags differ: %s -> %s" % (TAG.findall(src), TAG.findall(tgt)))
+    have, want = _literals(tgt), _literals(src)
+    if have != want:
+        errors.append("code, links or URLs changed: lost %s, added %s" % (sorted((want - have).elements()), sorted((have - want).elements())))
     if src.count("\n") != tgt.count("\n"):
         errors.append("line break count differs")
     # A closing ellipsis says the control opens a dialog or needs more input before it acts. Word order may move
@@ -415,21 +501,38 @@ def _check_text(src, tgt, base, rule, glossary, keep, max_ratio, form=None, grou
     src_dots, tgt_dots = (bool(re.search(r"(\.\.\.|\u2026)\s*$", s)) for s in (src, tgt))
     dots = lambda s: len(re.findall(r"\.\.\.|\u2026+", s))
     if src_dots != tgt_dots and dots(src) != dots(tgt):
-        errors.append("trailing ellipsis: the %s ends with one, the %s does not" % (("source", "translation") if src_dots else ("translation", "source")))
+        message = "trailing ellipsis: the %s ends with one, the %s does not" % (("source", "translation") if src_dots else ("translation", "source"))
+        # a control label needs it; in a sentence ("Gemini, Claude, ...") the language's own "etc." is right
+        (errors if len(src) <= 60 else warnings).append(message)
     # Terms kept as they are (brands) are masked first, so a brand like "Phone Remote" does not trigger the term "phone"
     # Command line flags, `code spans` and placeholders are never translated, so they are masked too
-    masked = re.sub(r"--[\w-]+|`[^`]*`", " ", PLACEHOLDER.sub(" ", src))
+    masked = _prose(src)
     for term in keep:
         masked = re.sub(_word(term), " ", masked, flags=re.I)
-    for term, wanted in glossary.items():
-        if re.search(_word(term), src if term in keep else masked, re.I) and not any(w.lower() in tgt.lower() for w in wanted):
-            errors.append("glossary: '%s' must appear as %s" % (term, " or ".join("'%s'" % w for w in wanted)))
-    if not re.search(r"[^\W\d_]", PLACEHOLDER.sub("", src)):
-        return errors, warnings  # nothing to translate (only symbols or placeholders)
+    # Longest terms first, each masked once matched: "back-translation" then never triggers the rule for "translation"
+    for term, wanted in sorted(glossary.items(), key=lambda t: -len(t[0])):
+        found = re.search(_word(term), src if term in keep else masked, re.I)
+        if found:
+            # the English kept as it is passes: a UI label the product only shows in English (**Profile**)
+            if not any(w.lower() in tgt.lower() for w in wanted) and found.group(0) not in tgt:
+                errors.append("glossary: '%s' must appear as %s" % (term, " or ".join("'%s'" % w for w in wanted)))
+            masked = re.sub(_word(term), " ", masked, flags=re.I)
+    bold_src, bold_tgt = _bold_problems(src), _bold_problems(tgt)
+    if bold_tgt and not bold_src:
+        errors.append("bold will not render: %s (a closing ** after punctuation needs a space or punctuation next)" % bold_tgt[0])
+    elif src.count("**") != tgt.count("**"):
+        warnings.append("bold markers %d -> %d" % (src.count("**"), tgt.count("**")))
+    if not re.search(r"[^\W\d_]", _prose(src)):
+        return errors, warnings  # nothing to translate (only symbols, placeholders, code, URLs or file names)
     if tgt == src and src.strip() not in glossary:
         warnings.append("identical to source (fine for names and loanwords, otherwise untranslated)")
     elif base in SCRIPTS and tgt != src and not re.search("[%s]" % SCRIPTS[base], tgt):
         warnings.append("no %s characters in the translation" % base)
+    if zh:  # code spans, URLs and file names may hold the other script on purpose
+        wrong = sorted(set(_prose(tgt)) & (SIMPLIFIED if zh == "hant" else TRADITIONAL))
+        if wrong:
+            names = ("Simplified", "Traditional") if zh == "hant" else ("Traditional", "Simplified")
+            warnings.append("%s characters in a %s Chinese translation: %s" % (names[0], names[1], "".join(wrong)))
     if len(tgt) > max_ratio * len(src) + 4 and len(src) <= 60:
         warnings.append("%d%% longer than source, check it fits the UI" % (100 * len(tgt) // max(len(src), 1) - 100))
     if form is None and base in COMPLEX_PLURAL and COUNT_NAME.search(src):
@@ -474,7 +577,8 @@ def check(source, target, lang, glossary=None, max_ratio=1.5):
     glossary = glossary or {}
     glossary = {term: [wanted] if isinstance(wanted, str) else list(wanted) for term, wanted in glossary.items()}
     keep = [term for term, wanted in glossary.items() if [term.lower()] == [w.lower() for w in wanted]]
-    check_text = lambda src, tgt, **kw: _check_text(src, tgt, base, rule, glossary, keep, max_ratio, **kw)
+    zh = zh_script(lang)
+    check_text = lambda src, tgt, **kw: _check_text(src, tgt, base, rule, glossary, keep, max_ratio, zh=zh, **kw)
     groups = plural_groups(source)
     for k, src in source.items():
         if _plural_member(k, groups):
@@ -618,6 +722,171 @@ def drift(source, back, threshold):
                 rows.append((ratio, k, src, back[k]))
     return sorted(rows)
 
+# ---------------------------------------------------------------- markdown (README and docs)
+
+MD_LIST = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)(.*)$")
+MD_HEADING = re.compile(r"^(#{1,6}\s+)(.*?)(\s*#*\s*)$")
+MD_QUOTE = re.compile(r"^(\s*>\s?)(.*)$")
+MD_IMAGE = re.compile(r"(!\[)([^\]]*)(\]\(([^)]*)\))")
+MD_ONLY_MEDIA = re.compile(r"^\s*(\[?!\[[^\]]*\]\([^)]*\)\]?(\([^)]*\))?\s*)+$")
+# Lines that are HTML blocks, not text that merely starts with an inline tag such as <kbd>
+MD_BLOCK_HTML = re.compile(r"^<(/?(p|div|picture|source|img|table|tr|td|th|br|hr|h[1-6]|a)\b|!--)", re.I)
+MD_CLOSE_HTML = re.compile(r"</(p|div|picture|table)>\s*$|-->\s*$", re.I)
+MD_ALT = re.compile(r'(alt=")([^"]*[A-Za-z][^"]*)(")')
+# A line of links to the README's languages, such as **English** | [中文](README.zh-CN.md)
+MD_LANGLINE = re.compile(r"\]\(\.?/?README(\.[\w-]+)?\.md\)")
+HASH_COMMENT_LANGS = {"", "bash", "sh", "shell", "console", "zsh", "ini", "toml", "yaml", "yml", "python", "py",
+                      "powershell", "ps1", "text", "txt", "conf", "dockerfile", "make", "r"}
+SLASH_COMMENT_LANGS = {"js", "javascript", "ts", "typescript", "jsx", "tsx", "jsonc", "c", "cpp", "cs", "java", "go",
+                       "rust", "swift", "kotlin", "dart", "php"}
+MD_BOX = re.compile(r"[│┐┘┤║╗╝]\s*$")  # a box drawing ends on its border; a tree line does not
+# "path/or.file   what it is": the description column of a directory listing without comment markers
+MD_LAYOUT = re.compile(r"^([\s│├└─]*[\w.\\/@-]*[./\\][\w.\\/@-]*\s{2,})(\S.*[A-Za-z]{2}.*)$")
+ENDONYMS = {"en": "English", "zh-cn": "简体中文", "zh-hans": "简体中文", "zh-tw": "繁體中文", "zh-hant": "繁體中文",
+            "zh-hk": "繁體中文（香港）", "ja": "日本語", "ko": "한국어", "es": "Español", "fr": "Français", "de": "Deutsch",
+            "it": "Italiano", "pt-br": "Português (Brasil)", "pt": "Português", "ru": "Русский", "uk": "Українська",
+            "ar": "العربية", "he": "עברית", "tr": "Türkçe", "vi": "Tiếng Việt", "th": "ไทย", "id": "Bahasa Indonesia",
+            "pl": "Polski", "nl": "Nederlands"}
+
+
+def md_split(text):
+    """A Markdown document as ({English: English}, skeleton). The segments are keyed by their English text,
+    like an English-keyed table: an edited README then shows new and removed paragraphs in `check` and edited
+    ones in `rekey`, where numbered ids would shift after the first inserted paragraph. The skeleton keeps
+    everything else verbatim: code (but its comments), HTML (but its alt text), badges, link definitions and
+    rules, with a numbered slot per segment; the language links line becomes {{LANGLINE}}, added under the
+    title when there is none."""
+    eol = "\r\n" if "\r\n" in text else "\n"
+    lines = text.lstrip("﻿").replace("\r\n", "\n").split("\n")
+    source, slots, skel, buf = {}, {}, [], []  # buf: (prefix, text) lines of the current paragraph, item or quote
+    st = {"fence": None, "lang": "", "html": False, "box": False}
+
+    def seg(text, kind="s"):  # kind: s for prose, c for a comment in code
+        if not re.search(r"[^\W\d_]", _prose(text)):
+            return text  # only code, a URL or a file name: nothing to translate, so not a segment
+        slot = "%s%03d" % (kind, len(slots) + 1)
+        slots[slot] = source[text] = text
+        return "{{%s}}" % slot
+
+    def flush():
+        if not buf:
+            return
+        if any(t.endswith("  ") or t.endswith("\\") for _, t in buf[:-1]):  # hard line breaks: a segment per line
+            skel.extend(p + seg(t.rstrip(" \\")) + t[len(t.rstrip(" \\")):] for p, t in buf)
+        else:  # soft wrapped lines render as one paragraph, so they are one segment
+            skel.append(buf[0][0] + seg(" ".join(t.strip() for _, t in buf)))
+        buf.clear()
+
+    def images(line):  # alt text of a picture is read aloud and shown when it fails to load; badges stay
+        return MD_IMAGE.sub(lambda m: m.group(0) if "shields.io" in m.group(4) or "badge" in m.group(4) or not re.search(r"[A-Za-z]{2}", m.group(2))
+                            else m.group(1) + seg(m.group(2)) + m.group(3), line)
+
+    for n, line in enumerate(lines):
+        s = line.strip()
+        if st["fence"]:
+            if s.startswith(st["fence"]):
+                st["fence"] = None
+                skel.append(line)
+                continue
+            if st["box"]:  # a box drawing stays whole: double width CJK characters would break its alignment
+                skel.append(line)
+                continue
+            # a comment in code is prose the reader needs; the code stays. A box drawing stays whole, since
+            # double width CJK characters would break its alignment
+            marker = "//" if st["lang"] in SLASH_COMMENT_LANGS else "#" if st["lang"] in HASH_COMMENT_LANGS else None
+            c = marker and not MD_BOX.search(line) and not s.startswith("#!") and re.match(r"^(|.*?\s)(%s\s+)(.*[A-Za-z]{2}.*)$" % re.escape(marker), line)
+            layout = not c and st["lang"] in ("", "text", "txt") and not MD_BOX.search(line) and MD_LAYOUT.match(line)
+            if layout and not re.search(r"(?<![\w./\\])[A-Za-z]{3,}(?![\w./\\])", layout.group(2)):
+                layout = None  # "input.py  media.py": more file names, not a description
+            skel.append(c.group(1) + c.group(2) + seg(c.group(3), "c") if c else layout.group(1) + seg(layout.group(2), "c") if layout else line)
+            continue
+        m = re.match(r"^\s*(```+|~~~+)\s*([^\s{]*)", line)
+        if m:
+            flush()
+            st["fence"], st["lang"] = m.group(1), m.group(2).lower()
+            block = []
+            for later in lines[n + 1:]:
+                if later.strip().startswith(m.group(1)):
+                    break
+                block.append(later)
+            # top and right corners mark a box drawing; a directory tree only uses ├ └ │ ─
+            st["box"] = bool(re.search("[┌┐┘╔╗╝+]-{3,}|[┌┐┘╔╗╝]", "\n".join(block)))
+            skel.append(line)
+        elif st["html"] or MD_BLOCK_HTML.match(s):
+            flush()
+            skel.append(MD_ALT.sub(lambda a: a.group(1) + seg(a.group(2)) + a.group(3), line))
+            st["html"] = not MD_CLOSE_HTML.search(s) if st["html"] or re.match(r"<(p|div|picture|table|!--)\b", s) else False
+        elif not s:
+            flush()
+            skel.append(line)
+        elif MD_LANGLINE.search(line) and "|" in line:
+            flush()
+            skel.append("{{LANGLINE}}")
+        elif MD_ONLY_MEDIA.match(line):
+            flush()
+            skel.append(images(line))
+        elif re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", s) or re.match(r"^\s*\[[^\]]+\]:\s*\S", line):
+            flush()
+            skel.append(line)
+        elif MD_HEADING.match(line):
+            flush()
+            h = MD_HEADING.match(line)
+            skel.append(h.group(1) + seg(h.group(2)) + h.group(3))
+        elif s.startswith("|"):
+            flush()
+            if re.fullmatch(r"\|?[\s:|-]+\|?", s):
+                skel.append(line)
+            else:
+                cells = re.split(r"(?<!\\)\|", s.strip("|"))
+                skel.append("| " + " | ".join(seg(c.strip()) if re.search(r"[A-Za-z]", c) else c.strip() for c in cells) + " |")
+        elif MD_LIST.match(line):
+            flush()
+            m = MD_LIST.match(line)
+            buf.append((m.group(1), m.group(2)))
+        elif MD_QUOTE.match(line):
+            m = MD_QUOTE.match(line)
+            if buf and not buf[0][0].lstrip().startswith(">"):
+                flush()
+            buf.append((m.group(1), m.group(2)))
+        elif line.startswith("    ") and not buf:
+            skel.append(line)  # indented code
+        else:
+            buf.append((buf[0][0] if buf else "", line))
+    flush()
+    if "{{LANGLINE}}" not in skel:
+        h1 = next((i for i, l in enumerate(skel) if l.startswith("# ")), None)
+        if h1 is not None:
+            skel[h1 + 1:h1 + 1] = ["", "{{LANGLINE}}"]
+    return source, {"eol": eol, "slots": slots, "lines": skel}
+
+
+def md_slug(heading):
+    """GitHub's anchor for a heading: link markup dropped, lowercased, punctuation removed, spaces to hyphens."""
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+    return re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+
+
+def md_langline(langs, lang):
+    """`**English** | [简体中文](README.zh-CN.md) | ...`: every language by its own name, the current one in bold.
+    The first language is the source and owns README.md."""
+    names = [ENDONYMS.get(l.lower(), ENDONYMS.get(l.lower().split("-")[0], l)) for l in langs]
+    files = ["README.md"] + ["README.%s.md" % l for l in langs[1:]]
+    return " | ".join("**%s**" % n if l == lang else "[%s](%s)" % (n, f) for l, n, f in zip(langs, names, files))
+
+
+def md_build(skeleton, source, target, lang, langs):
+    """(document, problems). Problems: a missing segment, a changed code span, link target or URL, and an
+    in-page #anchor that matches no heading of the translation."""
+    problems = ["missing translation: %s" % k[:80] for k in source if k not in target]
+    problems += ["code, links or URLs changed: %s" % k[:80] for k in source if k in target and _literals(source[k]) != _literals(target[k])]
+    slots = skeleton["slots"]
+    fill = lambda m: md_langline(langs, lang) if m.group(1) == "LANGLINE" else target.get(slots[m.group(1)], slots[m.group(1)])
+    text = "\n".join(re.sub(r"\{\{([sc]\d+|LANGLINE)\}\}", fill, line) for line in skeleton["lines"])
+    slugs = {md_slug(h) for h in re.findall(r"^#{1,6}\s+(.*?)\s*#*\s*$", text, re.M)}
+    problems += ["#%s matches no heading: point it at the translated heading's anchor" % a
+                 for a in re.findall(r"\]\(#([^)]+)\)", text) if a not in slugs]
+    return text.replace("\n", skeleton["eol"]), problems
+
 # ---------------------------------------------------------------- cli
 
 def _dump(obj, out):
@@ -654,12 +923,24 @@ def main(argv=None):
 
     p = sub.add_parser("emit", help="write flat JSON in a project format")
     p.add_argument("target", help="flat JSON {id: translation}")
-    p.add_argument("--format", required=True, choices=["json", "js", "py", "properties", "xml", "strings", "po"])
+    p.add_argument("--format", required=True, choices=["json", "js", "py", "properties", "xml", "strings", "po", "tsv"])
     p.add_argument("--lang", required=True)
     p.add_argument("--source", help="flat JSON source (needed for po)")
     p.add_argument("--nested", action="store_true", help="json: rebuild nesting from dotted ids")
     p.add_argument("--indent", type=int, default=2, help="js/py: spaces before the language block (entries get twice as many)")
     p.add_argument("-o", "--out")
+
+    p = sub.add_parser("md-split", help="a Markdown document (README, docs page) as source.json and skeleton.json")
+    p.add_argument("file")
+    p.add_argument("--out", required=True, help="work directory for source.json and skeleton.json")
+
+    p = sub.add_parser("md-build", help="rebuild a Markdown document from the skeleton and a translation")
+    p.add_argument("skeleton")
+    p.add_argument("--source", required=True)
+    p.add_argument("--target", required=True, help="the translation (the source itself to rebuild the original)")
+    p.add_argument("--lang", required=True)
+    p.add_argument("--langs", required=True, help="every language of the document, source first: en,zh-CN,zh-TW")
+    p.add_argument("-o", "--out", required=True)
 
     p = sub.add_parser("rekey", help="carry translations across edits of the English source (case, punctuation, spacing)")
     p.add_argument("--source", required=True, help="the current source")
@@ -711,6 +992,22 @@ def main(argv=None):
             Path(a.out).write_text(text, encoding="utf-8")
         else:
             sys.stdout.write(text)
+    elif a.cmd == "md-split":
+        source, skeleton = md_split(Path(a.file).read_bytes().decode("utf-8"))  # bytes keep \r\n line endings
+        Path(a.out).mkdir(parents=True, exist_ok=True)
+        _dump(source, str(Path(a.out, "source.json")))
+        _dump(skeleton, str(Path(a.out, "skeleton.json")))
+        comments = sum(s.startswith("c") for s in skeleton["slots"])
+        print("%d segments, %d of them comments in code (repeated texts share one entry)" % (len(source), comments))
+    elif a.cmd == "md-build":
+        skeleton = json.loads(Path(a.skeleton).read_text(encoding="utf-8"))
+        text, problems = md_build(skeleton, load(a.source), load(a.target), a.lang, a.langs.split(","))
+        for p in problems:
+            print("ERROR %s" % p)
+        if problems:
+            return 1
+        Path(a.out).write_bytes(text.encode("utf-8"))
+        print("wrote %s" % a.out)
     elif a.cmd == "rekey":
         new, carried, review = rekey(load(a.source), load(a.target), load(a.old_source) if a.old_source else None, a.threshold)
         for k, old in carried:

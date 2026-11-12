@@ -1,5 +1,7 @@
 # localize
 
+**English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
+
 An [Agent Skills](https://agentskills.io) skill (works in Claude Code, Codex, Gemini CLI, OpenCode and other agents that support the format) for localizing websites, web apps, mobile apps and desktop software into other languages, with checks that keep the translation accurate.
 
 Accurate UI translation fails in predictable ways: a one word label translated without its context, a product term translated three ways, a broken `{placeholder}`, a plural that is wrong for Russian or Arabic, a German label that no longer fits its button. The skill puts a source of context or a check in front of each:
@@ -17,10 +19,12 @@ Accurate UI translation fails in predictable ways: a one word label translated w
 | Regional variants | `regional` keeps only the rows es-MX changes from es, and refuses script variants |
 | RTL and layout | a checklist in the workflow; the UI has to be looked at |
 | Reliability claims | a review status record in the project, with fixed levels from `machine` to `native-line-by-line`; legal, payment and medical text gets a native reviewer |
+| READMEs and docs | `md-split` and `md-build` turn Markdown into segments (code comments and image alt text included) and back, and fail a changed code span, link or URL, a broken in-page anchor, or bold that would not render |
+| Simplified and Traditional Chinese | a warning for characters of the wrong script, and a guide to the vocabulary and typography zh-TW uses |
 
 ## Formats
 
-JSON (flat or nested) and `.arb`, `.po`/`.pot`, `.properties`, Android `strings.xml`, iOS `.strings`, and JS or Python tables keyed by the English text. Plural entries are read as one id per form. Anything else can be converted to flat JSON first; the checks work on `{id: text}`.
+JSON (flat or nested) and `.arb`, `.po`/`.pot`, `.properties`, Android `strings.xml`, iOS `.strings`, `.tsv`, JS or Python tables keyed by the English text, and Markdown documents such as a README. Plural entries are read as one id per form. Anything else can be converted to flat JSON first; the checks work on `{id: text}`.
 
 ## Install
 
@@ -40,8 +44,10 @@ python scripts/l10n.py --help
 
 ```
 SKILL.md                              the workflow the agent follows
-scripts/l10n.py                       export, context, check, emit, rekey, regional, diff, blind, backtrans
+scripts/l10n.py                       export, context, check, emit, md-split, md-build, rekey, regional, diff, blind, backtrans
 references/english-keyed-tables.md    projects that use the English text as the key
+references/readme.md                  translating a README or other Markdown document
+references/chinese.md                 Simplified and Traditional Chinese: vocabulary, typography, quoting a UI
 references/review-status.md           the review status record: levels and template
 references/phone-remote.md            worked example this skill was built and tested on
 tests/test_l10n.py                    python -m unittest discover -s tests
