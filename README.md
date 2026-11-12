@@ -1,6 +1,6 @@
 # localize
 
-A Claude skill for localizing websites, web apps, mobile apps and desktop software into other languages, with checks that keep the translation accurate.
+An [Agent Skills](https://agentskills.io) skill (works in Claude Code, Codex, Gemini CLI, OpenCode and other agents that support the format) for localizing websites, web apps, mobile apps and desktop software into other languages, with checks that keep the translation accurate.
 
 Accurate UI translation fails in predictable ways: a one word label translated without its context, a product term translated three ways, a broken `{placeholder}`, a plural that is wrong for Russian or Arabic, a German label that no longer fits its button. The skill puts a source of context or a check in front of each:
 
@@ -20,13 +20,13 @@ JSON (flat or nested) and `.arb`, `.po`, `.properties`, Android `strings.xml`, i
 
 ## Install
 
-Clone into your skills folder:
+Clone into the skills folder your agent reads: `~/.agents/skills/` for Codex, Gemini CLI, OpenCode and most others, `~/.claude/skills/` for Claude Code.
 
 ```bash
-git clone https://github.com/chrisye96/localize-skill ~/.claude/skills/localize
+git clone https://github.com/chrisye96/localize-skill ~/.agents/skills/localize
 ```
 
-Then ask Claude to add a language to a project ("translate this app into Spanish"). The script needs only Python 3.8+ and the standard library:
+Then ask your agent to add a language to a project ("translate this app into Spanish"). The script needs only Python 3.8+ and the standard library:
 
 ```bash
 python scripts/l10n.py --help
@@ -35,7 +35,7 @@ python scripts/l10n.py --help
 ## Layout
 
 ```
-SKILL.md                              the workflow Claude follows
+SKILL.md                              the workflow the agent follows
 scripts/l10n.py                       export, context, check, emit, blind, backtrans
 references/english-keyed-tables.md    projects that use the English text as the key
 references/phone-remote.md            worked example this skill was built and tested on
